@@ -541,6 +541,10 @@ class MmuAceController:
         self.eventloop = self.server.get_event_loop()
         self._last_status_update = 0.0
         self._status_update_task: Optional[asyncio.Task] = None
+        # Tracks the single in-flight _plan_load_ace retry loop. set_ace() can be
+        # re-entered (via reinit()); without tracking, overlapping retry loops
+        # would both poll query_objects for up to ~20s.
+        self._plan_load_task: Optional[asyncio.Task] = None
         self._status_update_delay = 0.2  # 200ms debounce for rapid commands
         self._throttle_delay = 0.3  # 300ms minimum delay between updates (max 3/sec)
         self._pending_update = False  # Flag to track if update is needed
@@ -770,7 +774,12 @@ class MmuAceController:
         self.ace = ace
         self._handle_status_update(force=True)
 
-        self.eventloop.create_task(self._plan_load_ace())
+        # Cancel a retry loop left over from an earlier set_ace()/reinit() call
+        # so only one _plan_load_ace can poll at a time.
+        if self._plan_load_task is not None and not self._plan_load_task.done():
+            logging.info("set_ace: cancelling stale _plan_load_ace task")
+            self._plan_load_task.cancel()
+        self._plan_load_task = self.eventloop.create_task(self._plan_load_ace())
 
     async def _plan_load_ace(self, retry=10, delay=2):
         for _ in range(retry):
@@ -1457,6 +1466,11 @@ class MmuAcePatcher:
         self.kobra.register_status_patcher(self.patch_status)
 
         self.kobra.register_print_data_patcher(self.patch_print_data)
+
+        # Tracks the single in-flight auto-feed poller (issue #464). patch_print_data
+        # runs inside kobra.py's network retry loop, so without tracking, a retried
+        # print start would spawn duplicate pollers that all fire FEED_FILAMENT.
+        self._auto_feed_task = None
 
         # Add AnycubicSlicerNext to supported slicers
         self.setup_anycubic_slicer()
@@ -2381,7 +2395,13 @@ class MmuAcePatcher:
                     f"patch_print_data: no filament currently loaded, "
                     f"scheduling auto-feed for gate {target_gate} (via {source})"
                 )
-                self.ace_controller.eventloop.create_task(
+                # Cancel a poller left over from an earlier print-start attempt
+                # (patch_print_data is re-entered on each kobra.py network retry)
+                # so only one auto-feed can ever fire for this print.
+                if self._auto_feed_task is not None and not self._auto_feed_task.done():
+                    logging.info("patch_print_data: cancelling stale auto-feed task")
+                    self._auto_feed_task.cancel()
+                self._auto_feed_task = self.ace_controller.eventloop.create_task(
                     self._auto_feed_at_print_start(target_gate)
                 )
 
