@@ -244,6 +244,19 @@ TOOL_GATE_BYPASS = -2
 # Maximum tools for memory management (prevents unbounded list growth)
 MAX_TOOLS = 32  # Reasonable limit for multi-material printing
 
+# ACE auto-feed defaults (issue #464). Tuned for the ACE Pro tube length on
+# Kobra 3 Combo; ACE v1 and other K-series tube lengths may need different
+# values. Promote to moonraker config once we have more hardware data points.
+ACE_AUTO_FEED_LENGTH_MM = 80
+ACE_AUTO_FEED_SPEED_MM_S = 25
+
+# print_stats.state values that mean "this print isn't going to happen". The
+# auto-feed poller treats any of these as a signal to abandon waiting rather
+# than burn through its full heat-up timeout after a user cancel or error.
+ACE_AUTO_FEED_DEAD_PRINT_STATES = frozenset({
+    "cancelled", "complete", "error", "standby"
+})
+
 FILAMENT_POS_UNKNOWN = -1
 FILAMENT_POS_UNLOADED = 0 # Parked in gate
 FILAMENT_POS_HOMED_GATE = 1 # Homed at either gate or gear sensor (currently assumed mutually exclusive sensors)
@@ -2449,57 +2462,103 @@ class MmuAcePatcher:
         170 C (extru_temp) and 140 C (extru_end_temp) -- feeding during that
         window would either be rejected by min_extrude_temp or ooze onto the
         probing nozzle.
+
+        Aborts early if the print enters a terminal state (cancelled / error /
+        complete / standby) so a user-cancelled print doesn't leave the poller
+        spinning for the full MAX_WAIT_SECONDS. Cancellation by the
+        patch_print_data retry-tracker raises asyncio.CancelledError, which is
+        caught at the outer scope so the task ends with a clear log line
+        rather than the asyncio default "Task was destroyed" warning.
         """
         FEED_TARGET_MIN = 190
         FEED_TEMP_MARGIN = 10
-        FEED_LENGTH = 80
-        FEED_SPEED = 25
         MAX_WAIT_SECONDS = 600
         POLL_INTERVAL = 2.0
 
-        start = time.time()
-        while time.time() - start < MAX_WAIT_SECONDS:
-            try:
-                # Bail if loaded externally (e.g. via MMU_LOAD or T-command)
-                if self.ace.loaded_gate != TOOL_GATE_UNKNOWN:
-                    logging.info(
-                        f"auto-feed: gate {self.ace.loaded_gate} loaded externally, "
-                        f"skipping scheduled auto-feed"
-                    )
-                    return
+        try:
+            start = time.time()
+            while time.time() - start < MAX_WAIT_SECONDS:
+                try:
+                    # Bail if loaded externally (e.g. via MMU_LOAD or T-command)
+                    if self.ace.loaded_gate != TOOL_GATE_UNKNOWN:
+                        logging.info(
+                            f"auto-feed: gate {self.ace.loaded_gate} loaded externally, "
+                            f"skipping scheduled auto-feed"
+                        )
+                        return
 
-                result = await self.ace_controller.printer.query_objects({
-                    "extruder": ["temperature", "target"]
-                })
-                ext = result.get("extruder", {}) if isinstance(result, dict) else {}
-                temp = float(ext.get("temperature", 0) or 0)
-                target = float(ext.get("target", 0) or 0)
+                    result = await self.ace_controller.printer.query_objects({
+                        "extruder": ["temperature", "target"],
+                        "print_stats": ["state"],
+                    })
+                    if not isinstance(result, dict):
+                        result = {}
 
-                if target >= FEED_TARGET_MIN and temp >= (target - FEED_TEMP_MARGIN):
-                    ace_id = gate // 4
-                    local_index = gate % 4
-                    gcode = (
-                        f"FEED_FILAMENT ID={ace_id} INDEX={local_index} "
-                        f"LENGTH={FEED_LENGTH} SPEED={FEED_SPEED}"
-                    )
-                    logging.info(f"auto-feed: sending {gcode}")
-                    await self.ace_controller.printer.send_gcode(gcode)
+                    # Bail if the print is no longer running. Covers user
+                    # cancel, gklib error, completion, and unexpected fall back
+                    # to standby before heat-up — without this the poller
+                    # would keep waiting up to MAX_WAIT_SECONDS after a cancel.
+                    print_stats = result.get("print_stats") or {}
+                    state = str(print_stats.get("state", "") or "").lower()
+                    if state in ACE_AUTO_FEED_DEAD_PRINT_STATES:
+                        logging.info(
+                            f"auto-feed: print state is '{state}', "
+                            f"abandoning auto-feed for gate {gate}"
+                        )
+                        return
 
-                    # Update internal state to reflect the loaded gate
-                    self.ace.gate = gate
-                    self.ace.tool = gate
-                    self.ace.loaded_gate = gate
-                    return
+                    ext = result.get("extruder") or {}
+                    temp = float(ext.get("temperature", 0) or 0)
+                    target = float(ext.get("target", 0) or 0)
 
-            except Exception as exc:
-                logging.warning(f"auto-feed: poll error: {exc}")
+                    if target >= FEED_TARGET_MIN and temp >= (target - FEED_TEMP_MARGIN):
+                        ace_id = gate // 4
+                        local_index = gate % 4
+                        gcode = (
+                            f"FEED_FILAMENT ID={ace_id} INDEX={local_index} "
+                            f"LENGTH={ACE_AUTO_FEED_LENGTH_MM} "
+                            f"SPEED={ACE_AUTO_FEED_SPEED_MM_S}"
+                        )
+                        logging.info(f"auto-feed: sending {gcode}")
+                        await self.ace_controller.printer.send_gcode(gcode)
 
-            await asyncio.sleep(POLL_INTERVAL)
+                        self._commit_loaded_gate(gate)
+                        return
 
-        logging.warning(
-            f"auto-feed: gave up after {MAX_WAIT_SECONDS}s "
-            f"(extruder target never reached {FEED_TARGET_MIN} C)"
-        )
+                except asyncio.CancelledError:
+                    # Never swallow cancellation via the broad Exception
+                    # catch below — propagate to the outer handler so the
+                    # task ends promptly and is logged.
+                    raise
+                except Exception as exc:
+                    logging.warning(f"auto-feed: poll error: {exc}")
+
+                await asyncio.sleep(POLL_INTERVAL)
+
+            logging.warning(
+                f"auto-feed: gave up after {MAX_WAIT_SECONDS}s "
+                f"(extruder target never reached {FEED_TARGET_MIN} C)"
+            )
+        except asyncio.CancelledError:
+            # patch_print_data cancels stale pollers before spawning new
+            # ones; shutdown lands here too. No cleanup needed: the loaded
+            # state is only mutated by _commit_loaded_gate on the success
+            # path, so cancellation can never leave split state behind.
+            logging.info(f"auto-feed: cancelled before completing (gate {gate})")
+            raise
+
+    def _commit_loaded_gate(self, gate: int) -> None:
+        """Atomically mark `gate` as the gate now loaded into the toolhead.
+
+        Single-threaded asyncio guarantees no concurrent reader can see
+        split state across these three assignments — but ONLY if no
+        `await` is introduced between them. Keep the writes here, in a
+        sync helper, so the invariant is visible and a future change
+        cannot accidentally interleave an await between the fields.
+        """
+        self.ace.gate = gate
+        self.ace.tool = gate
+        self.ace.loaded_gate = gate
 
     def _combine(self, sourceA, sourceB):
         result = {}
